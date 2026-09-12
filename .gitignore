@@ -1,0 +1,4 @@
+.swarmbridge/
+node_modules/
+*.tmp-*
+_swarm-tmp/

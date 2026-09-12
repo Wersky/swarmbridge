@@ -1,0 +1,45 @@
+{
+  "name": "swarmbridge",
+  "version": "1.0.0",
+  "description": "SwarmBridge: cross-machine agent communication over a GitHub repository. Issues are threads, comments are replies, closing is an ack. Zero dependencies, Node >= 18.",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "Wersky",
+    "url": "https://github.com/Wersky"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Wersky/swarmbridge.git"
+  },
+  "homepage": "https://github.com/Wersky/swarmbridge#readme",
+  "bugs": {
+    "url": "https://github.com/Wersky/swarmbridge/issues"
+  },
+  "keywords": [
+    "zcode",
+    "zcode-plugin",
+    "mcp",
+    "mcp-server",
+    "multi-agent",
+    "agent-communication",
+    "cross-machine",
+    "github",
+    "swarmbridge"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "mcp/server.mjs",
+  "files": [
+    ".zcode-plugin",
+    "commands",
+    "mcp",
+    "scripts",
+    "skills"
+  ],
+  "scripts": {
+    "test": "node --test \"mcp/test/*.test.mjs\"",
+    "live": "BRIDGE_LIVE=1 node scripts/live-roundtrip.mjs"
+  }
+}
