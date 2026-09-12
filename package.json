@@ -40,6 +40,7 @@
   ],
   "scripts": {
     "test": "node --test \"mcp/test/*.test.mjs\"",
-    "live": "BRIDGE_LIVE=1 node scripts/live-roundtrip.mjs"
+    "live": "BRIDGE_LIVE=1 node scripts/live-roundtrip.mjs",
+    "bench": "BRIDGE_LIVE=1 node scripts/bench.mjs"
   }
 }
