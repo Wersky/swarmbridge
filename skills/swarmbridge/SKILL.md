@@ -38,11 +38,13 @@ bridge_send { to: "Alice/main", type: "task", subject: "实现XX接口",
 ```
 把返回的 issue 编号记下来（线程句柄）。
 
-### 2. 轮询收件箱（关键习惯）
-**GitHub 无法向本机推送（webhook 需要公网入口），实时性 = 轮询间隔 + 网络往返。**
-- 主代理每完成一个自己的动作（收波、派发、收到用户消息）顺手 `bridge_inbox` 查一次；
-- 或显式等待对方结果时，以 ≥1.5s 间隔轮询（实测发出→对方可见约 2~6s）；
+### 2. 等待与收件箱（1.1.0 起有门铃推送）
+**默认双通道：ntfy 门铃推送（~0.3s 传播）+ GitHub 轮询兜底。**
+- **等对方回复**：发完消息后 `bridge_wait {timeout:10~20}` —— 铃响立即返回，随后 `bridge_inbox` 消费；比干等轮询快一个量级（实测单向 0.9s vs 3~8s）；
+- **平时**：主代理每完成一个自己的动作（收波、派发、收到用户消息）顺手 `bridge_inbox` 查一次；
+- **门铃关闭/挂了**：`bridge_wait` 会提示未开启，退回轮询模式，正确性不受影响；
 - 收件箱按游标增量，幂等可反复调；游标按身份落盘在 `<workspace>/.swarmbridge/`，会话中断可恢复。
+- 门铃配置：`BRIDGE_NTFY_URL`（默认 https://ntfy.sh）、`BRIDGE_NTFY_TOPIC`（默认由仓库名派生；设 off 关闭）。铃只含元数据，正文永远只在 GitHub。
 
 ### 3. 处理收到的消息
 - `task` → 转成本地任务树节点（taskswarm 的 `task_add`），做完后 `bridge_reply { type: "result", data: { artifacts } }`；
@@ -54,6 +56,10 @@ bridge_send { to: "Alice/main", type: "task", subject: "实现XX接口",
 - 点名投递：对方发 `to: "Wersky/agent-2"` 时，只有该子代理的收件箱会收到（主代理不代收）；
 - 广播 `to: "Wersky/*"` 由主身份与所有子身份各自收到；
 - 主代理派发本地子代理任务时，把收到的桥消息摘要写进子代理 prompt（桥消息不会自动进入子代理上下文）。
+
+## 自建中继（实验性，未实测）
+
+内网级延迟（10~200ms）可用 `relay/server.mjs`：两端 `BRIDGE_API_BASE` 指向它，协议与工具完全不变。**该组件未经跨机实测，不保证稳定性**；随时可把 `BRIDGE_API_BASE` 改回 `https://api.github.com` 无损切回 GitHub。
 
 ## 硬性约定与坑
 

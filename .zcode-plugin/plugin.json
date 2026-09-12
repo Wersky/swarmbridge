@@ -1,12 +1,14 @@
 {
   "name": "swarmbridge",
-  "version": "1.0.0",
-  "description": "蜂群桥：跨机器 Agent 通信。用 GitHub 仓库的 Issues 作消息总线，让两台机器各自的 agent 与子代理并行收发消息（信封寻址 + 增量收件箱 + ack 回执闭环）。零依赖 Node。",
+  "version": "1.1.0",
+  "description": "蜂群桥：跨机器 Agent 通信。用 GitHub 仓库的 Issues 作消息总线，让两台机器各自的 agent 与子代理并行收发消息（信封寻址 + 增量收件箱 + ack 回执闭环）。零依赖 Node。1.1.0：ntfy 门铃推送（单向 ~0.9s）与可选自建中继。",
   "description_i18n": {
     "en": "SwarmBridge: cross-machine agent communication over a GitHub repository (issues as threads, comments as replies, cursor-based inbox, ack loop). Zero-dependency Node.",
     "zh-CN": "蜂群桥：跨机器 Agent 通信。用 GitHub 仓库的 Issues 作消息总线，让两台机器各自的 agent 与子代理并行收发消息。零依赖 Node。"
   },
-  "author": { "name": "Wersky" },
+  "author": {
+    "name": "Wersky"
+  },
   "license": "MIT",
   "skills": "skills",
   "commands": "commands",
@@ -14,7 +16,9 @@
     "swarmbridge": {
       "type": "stdio",
       "command": "node",
-      "args": ["${ZCODE_PLUGIN_ROOT}/mcp/server.mjs"],
+      "args": [
+        "${ZCODE_PLUGIN_ROOT}/mcp/server.mjs"
+      ],
       "cwd": "${ZCODE_PROJECT_DIR}",
       "env": {
         "BRIDGE_TOKEN": "${user_config.github_token}",

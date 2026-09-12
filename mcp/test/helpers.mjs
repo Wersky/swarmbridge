@@ -142,9 +142,87 @@ export function startGithubStub() {
 }
 
 // ---------------------------------------------------------------------------
+// ntfy stub：记录门铃发布 + 支持 JSON 订阅流（含建立连接时的重放）
+// ---------------------------------------------------------------------------
+export function startNtfyStub() {
+  const topics = new Map();   // topic → [{id, time, message}]
+  const streams = new Map();  // topic → Set<res>
+  let nextId = 1;
+
+  function broadcast(topic, msg) {
+    for (const res of streams.get(topic) ?? []) {
+      try { res.write(JSON.stringify(msg) + '\n'); } catch { /* 断开的连接 */ }
+    }
+  }
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://ntfy-stub');
+    const topic = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      // POST /{topic} —— 发布门铃
+      if (req.method === 'POST') {
+        const list = topics.get(topic) ?? [];
+        const msg = { id: String(nextId++), time: Math.floor(Date.now() / 1000), event: 'message', message: Buffer.concat(chunks).toString('utf8') };
+        list.push(msg);
+        topics.set(topic, list);
+        broadcast(topic, msg);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ id: msg.id }));
+        return;
+      }
+      // GET /{topic}/json —— 订阅流：先重放历史，再保持连接推送新消息
+      if (req.method === 'GET' && url.pathname.endsWith('/json')) {
+        // ⚠️ 流的 topic 必须去掉 /json 后缀，与 POST 的 key 一致，
+        // 否则 broadcast 永远找不到订阅流（实测踩过）。
+        const streamTopic = topic.replace(/\/json$/, '');
+        res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        // ⚠️ writeHead 只缓存头部，首次 body write 才上线。空主题若无任何写入，
+        // 客户端会永远收不到响应（实测踩过：curl/fetch 双双超时）。
+        // 真实 ntfy 也会先推一条 open 事件，这里保持一致。
+        res.write(JSON.stringify({ event: 'open', time: Math.floor(Date.now() / 1000) }) + '\n');
+        const list = topics.get(streamTopic) ?? [];
+        for (const msg of list) res.write(JSON.stringify(msg) + '\n');
+        if (!streams.has(streamTopic)) streams.set(streamTopic, new Set());
+        streams.get(streamTopic).add(res);
+        // ⚠️ 必须监听 res 的 close（连接断开），而不是 req 的——
+        // GET 请求体结束后 req 的 close 会立刻触发，把刚注册的流删掉，
+        // 之后所有广播都找不到订阅者（实测踩过：铃发出去但没人收到）。
+        res.on('close', () => streams.get(streamTopic)?.delete(res));
+        return; // 保持连接
+      }
+      res.writeHead(404); res.end();
+    });
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        url: `http://127.0.0.1:${server.address().port}`,
+        /** 等待某主题出现 ≥n 条发布（门铃是 fire-and-forget，断言前要等它落地） */
+        async waitForPublishes(topic, n = 1, maxMs = 4000) {
+          const t0 = Date.now();
+          for (;;) {
+            if ((topics.get(topic)?.length ?? 0) >= n) return topics.get(topic);
+            if (Date.now() - t0 > maxMs) return topics.get(topic) ?? [];
+            await new Promise(r => setTimeout(r, 50));
+          }
+        },
+        publishes: (topic) => topics.get(topic) ?? [],
+        close: () => {
+          for (const set of streams.values()) for (const res of set) { try { res.destroy(); } catch { /* 已断开 */ } }
+          server.close();
+        },
+      });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // swarmbridge server 子进程客户端
 // ---------------------------------------------------------------------------
-export function connect({ identity, workspace, apiBase, token = GOOD_TOKEN, repo = 'acct/shared' }) {
+export function connect({ identity, workspace, apiBase, token = GOOD_TOKEN, repo = 'acct/shared', ntfyUrl, ntfyTopic }) {
   const child = registerChild(spawn(process.execPath, [SERVER], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
@@ -153,6 +231,9 @@ export function connect({ identity, workspace, apiBase, token = GOOD_TOKEN, repo
       BRIDGE_TOKEN: token,
       BRIDGE_ID: identity,
       BRIDGE_REPO: repo,
+      // 门铃默认指向不可达地址：不经过 withBridge（注入 stub ntfy）的连接绝不触达真实 ntfy
+      BRIDGE_NTFY_URL: ntfyUrl ?? 'http://127.0.0.1:1',
+      BRIDGE_NTFY_TOPIC: ntfyTopic ?? '',
       // 明确清空其他 token 变体，保证测试不受宿主环境影响
       GITHUB_TOKEN: '', GH_TOKEN: '',
     },
@@ -201,7 +282,7 @@ export function connect({ identity, workspace, apiBase, token = GOOD_TOKEN, repo
   }
 
   return {
-    child, rpc, call, callRaw,
+    child, rpc, call, callRaw, stderr: () => stderrBuf,
     kill() {
       try { child.stdin.end(); } catch { /* 已关闭 */ }
       const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } }, 1500);
@@ -233,21 +314,23 @@ export function rmWorkspace(dir) {
  */
 export async function withBridge(fn, opts = {}) {
   const stub = await startGithubStub();
+  const ntfy = await startNtfyStub();
   const conns = [];
   const wsDir = makeWorkspace();
   const mk = (identity, extra = {}) => {
-    const c = connect({ identity, workspace: wsDir, apiBase: stub.url, ...extra });
+    const c = connect({ identity, workspace: wsDir, apiBase: stub.url, ntfyUrl: ntfy.url, ...extra });
     conns.push(c);
     return c;
   };
   try {
-    return await fn({ stub, mk, workspace: wsDir });
+    return await fn({ stub, ntfy, mk, workspace: wsDir });
   } finally {
     for (const c of conns) { try { c.kill(); } catch { /* 已退出 */ } }
     // 给优雅退出留一点时间，再兜底强杀
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
     reapAll();
     stub.close();
+    ntfy.close();
     rmWorkspace(wsDir);
   }
 }

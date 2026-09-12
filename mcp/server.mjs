@@ -51,7 +51,14 @@ function cfg() {
   const repo = (process.env.BRIDGE_REPO || '').trim();   // 形如 "owner/name"
   const id = (process.env.BRIDGE_ID || '').trim();       // 本方身份，如 "wersky/main"
   const apiBase = (process.env.BRIDGE_API_BASE || 'https://api.github.com').replace(/\/+$/, '');
-  return { token, repo, id, apiBase };
+  // 门铃（可选，默认开启）：GitHub 无本机推送，用 ntfy 把「有新消息」推给对方，
+  // 省掉轮询等待与列表索引传播（实测门铃送达 ~750ms，GitHub 新线程传播 2.5-7s）。
+  //   BRIDGE_NTFY_URL    ntfy 服务器（默认 https://ntfy.sh，可自托管）
+  //   BRIDGE_NTFY_TOPIC  主题；设为 "off" 关闭门铃；缺省由仓库名自动派生（双端零配置一致）
+  // 话题名公开可猜（只泄露元数据：issue 号/身份/类型），正文始终只在 GitHub —— 私有仓库内容不上 ntfy。
+  const ntfyUrl = (process.env.BRIDGE_NTFY_URL || 'https://ntfy.sh').replace(/\/+$/, '');
+  const ntfyTopicRaw = process.env.BRIDGE_NTFY_TOPIC !== undefined ? process.env.BRIDGE_NTFY_TOPIC.trim() : '';
+  return { token, repo, id, apiBase, ntfyUrl, ntfyTopicRaw };
 }
 
 function workspaceOf(args) {
@@ -271,7 +278,121 @@ function requireCfg(args) {
   if (!from) {
     throw new BridgeError('BRIDGE_ID 未配置。下一步：设置环境变量 BRIDGE_ID（本方身份，如 "wersky/main"），或调用时传 from。');
   }
-  return { ...c, repo, from };
+  // 门铃主题解析：显式 "off" 关闭；显式值直接用；缺省由仓库名派生（双端零配置一致）
+  let ntfyTopic = null;
+  if (c.ntfyTopicRaw === 'off') {
+    ntfyTopic = null;
+  } else if (c.ntfyTopicRaw) {
+    ntfyTopic = c.ntfyTopicRaw;
+  } else {
+    ntfyTopic = `swarmbridge-${crypto.createHash('sha256').update(repo).digest('hex').slice(0, 12)}`;
+  }
+  return { ...c, repo, from, ntfyTopic };
+}
+
+// ---------------------------------------------------------------------------
+// 门铃（ntfy）：fire-and-forget 的「有新消息」通知。
+// 只发元数据（issue 号/身份/类型），不发正文 —— 正文永远只在 GitHub。
+// 失败静默：GitHub 是唯一事实源，门铃只是加速器，挂了就退回轮询模式。
+// ---------------------------------------------------------------------------
+function publishDoorbell(c, env, issue) {
+  if (!c.ntfyTopic) return;
+  const payload = JSON.stringify({
+    bridge: BRIDGE_MARKER, kind: 'ring', repo: c.repo, issue,
+    messageId: env.id, from: env.from, to: env.to, type: env.type,
+    ts: new Date().toISOString(),
+  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5000);
+  fetch(`${c.ntfyUrl}/${encodeURIComponent(c.ntfyTopic)}`, {
+    method: 'POST',
+    body: payload,
+    headers: { 'User-Agent': 'swarmbridge-doorbell' },
+    signal: ctrl.signal,
+  }).catch((e) => { process.stderr.write('[doorbell-err] ' + (e?.name ?? '') + ' ' + (e?.message ?? '') + ' ' + (e?.cause?.code ?? '') + '\n'); }).finally(() => clearTimeout(timer));
+}
+
+// ---------------------------------------------------------------------------
+// 门铃接收端：后台订阅 ntfy 的 JSON 流，把响铃记进内存环形缓冲。
+// bridge_wait（阻塞等铃）与 bridge_ring（非阻塞查看）从这里取。
+// 消费过滤：只投递「发给本方身份的、且不是本方自己发的」铃。
+// ---------------------------------------------------------------------------
+const doorbellState = {
+  rings: [],            // {issue, from, to, type, messageId, at}
+  started: false,
+  topic: null,
+  url: null,
+  connected: false,
+};
+
+function takeMyRings(identity) {
+  const mine = [];
+  const rest = [];
+  for (const r of doorbellState.rings) {
+    (toMatches(r.to, identity) && r.from !== identity ? mine : rest).push(r);
+  }
+  doorbellState.rings = rest;
+  return mine;
+}
+
+/** 只读计数（不清空缓冲）——status 展示用；清空走 takeMyRings */
+function peekMyRings(identity) {
+  return doorbellState.rings.filter(r => toMatches(r.to, identity) && r.from !== identity).length;
+}
+
+function ensureDoorbellListener(c) {
+  if (!c.ntfyTopic) return null;
+  // 同一进程身份固定（BRIDGE_ID），主题/URL 变化只可能在重启后出现
+  if (!doorbellState.started) {
+    doorbellState.started = true;
+    doorbellState.topic = c.ntfyTopic;
+    doorbellState.url = c.ntfyUrl;
+    doorbellStreamLoop(c).catch(() => { /* 后台尽力而为 */ });
+  }
+  return doorbellState;
+}
+
+async function doorbellStreamLoop(c) {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  for (;;) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 65000); // 长连接 65s 自愈重连
+    try {
+      const res = await fetch(`${c.ntfyUrl}/${encodeURIComponent(c.ntfyTopic)}/json?since=10m`, {
+        headers: { 'User-Agent': 'swarmbridge-doorbell' },
+        signal: ctrl.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      doorbellState.connected = true;
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let evt; try { evt = JSON.parse(line); } catch { continue; }
+          if (evt.event !== 'message' || !evt.message) continue;
+          let env; try { env = JSON.parse(evt.message); } catch { continue; }
+          if (env.bridge !== BRIDGE_MARKER || env.kind !== 'ring') continue;
+          doorbellState.rings.push({
+            issue: env.issue, from: env.from, to: env.to, type: env.type,
+            messageId: env.messageId, at: evt.time ? new Date(evt.time * 1000).toISOString() : new Date().toISOString(),
+          });
+          if (doorbellState.rings.length > 50) doorbellState.rings.splice(0, doorbellState.rings.length - 50);
+        }
+      }
+    } catch {
+      doorbellState.connected = false; // 断流：轮询兜底仍然可用
+    } finally {
+      clearTimeout(timer);
+    }
+    await sleep(2000); // 断线重连间隔
+  }
 }
 
 /** base = apiBase + /repos/{repo} */
@@ -286,6 +407,9 @@ async function bridgeStatus(args) {
     apiBase: c.apiBase,
     token: c.token ? `已配置（***${c.token.slice(-4)}）` : '未配置',
     cursor: cursor ? { since: cursor.since, seenThreads: Object.keys(cursor.seen ?? {}).length } : '（尚无收件记录）',
+    doorbell: c.ntfyTopic
+      ? { enabled: true, url: c.ntfyUrl, topic: c.ntfyTopic, connected: doorbellState.connected, pendingRings: peekMyRings(c.from) }
+      : { enabled: false, note: 'BRIDGE_NTFY_TOPIC=off，纯 GitHub 轮询模式' },
     stateDir: stateDir(args),
   };
   if (args?.check === true) {
@@ -319,6 +443,7 @@ async function bridgeSend(args) {
     token: c.token, apiBase: c.apiBase,
     body: { title: issueTitle(env), body: JSON.stringify(env, null, 2) },
   });
+  publishDoorbell(c, env, created.number);
   return {
     ok: true,
     issue: created.number,
@@ -326,6 +451,7 @@ async function bridgeSend(args) {
     messageId: env.id,
     to: env.to,
     type: env.type,
+    ...(c.ntfyTopic ? { doorbell: `已响铃（${c.ntfyUrl}/${c.ntfyTopic}）——对方若在 bridge_wait，约 1~2 秒即可看到` } : {}),
     hint: '对方需轮询 bridge_inbox 才能看到（GitHub 无法向本机推送）。紧急事项请通知对方查看。',
   };
 }
@@ -450,6 +576,7 @@ async function bridgeReply(args) {
   });
   // 自己的回帖会刷新线程 updated_at，记入游标避免下次轮询回声给自己
   noteOwnActivity(args, c.from, info.number, created?.created_at);
+  publishDoorbell(c, env, info.number);
   return { ok: true, issue: info.number, commentId: created.id, messageId: env.id, to: env.to, type: env.type };
 }
 
@@ -475,7 +602,53 @@ async function bridgeAck(args) {
     closedAt = patched?.updated_at ?? closedAt;
   }
   noteOwnActivity(args, c.from, info.number, closedAt);
+  publishDoorbell(c, env, info.number);
   return { ok: true, issue: info.number, state: 'closed', hint: '线程已关闭 = 回执已送达。对方在其收件箱里会看到 closed 状态（确认闭环）。' };
+}
+
+// ---------------------------------------------------------------------------
+// bridge_wait / bridge_ring —— 门铃的接收端
+//
+// 这两个工具**绕过全局串行队列**：它们只读内存中的响铃缓冲、不碰游标文件，
+// 阻塞等待不会卡住同进程里其他子代理的收发。
+// ---------------------------------------------------------------------------
+const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function bridgeWait(args) {
+  const c = requireCfg(args);
+  const L = ensureDoorbellListener(c);
+  if (!L) {
+    return { rung: false, waitedMs: 0, rings: [],
+      hint: '门铃未开启（BRIDGE_NTFY_TOPIC=off）。直接轮询 bridge_inbox 即可，速度退回纯 GitHub 模式。' };
+  }
+  const timeout = Math.min(Math.max(Number(args?.timeout ?? 10), 0), 25);
+  const t0 = Date.now();
+  let rings = takeMyRings(c.from);
+  while (rings.length === 0 && Date.now() - t0 < timeout * 1000) {
+    await sleepMs(150);
+    rings = takeMyRings(c.from);
+  }
+  return {
+    rung: rings.length > 0,
+    rings,
+    waitedMs: Date.now() - t0,
+    hint: rings.length > 0
+      ? '门铃已响 → 立即 bridge_inbox 消费新消息。'
+      : '超时未响：对方尚未发送，或对方门铃关闭。bridge_inbox 轮询兜底仍可用。',
+  };
+}
+
+async function bridgeRing(args) {
+  const c = requireCfg(args);
+  const L = ensureDoorbellListener(c);
+  if (!L) return { enabled: false, connected: false, rings: [], hint: '门铃未开启（BRIDGE_NTFY_TOPIC=off）。' };
+  const rings = takeMyRings(c.from);
+  return {
+    enabled: true,
+    connected: L.connected,
+    rings,
+    hint: rings.length > 0 ? '有未消费的门铃 → bridge_inbox 消费。' : '暂无铃；门铃流保持监听中。',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +719,20 @@ const TOOLS = [
       properties: { issue: { type: 'number' }, note: { type: 'string', description: '处理结论，一句话' } },
     },
   },
+  {
+    name: 'bridge_wait', description: '阻塞等待门铃（对方发消息会实时推铃）：响铃即返回，最多等 timeout 秒（≤25）。适合「发完任务等回复」的场景。不会影响同进程其他代理的收发。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeout: { type: 'number', description: '最长等待秒数（默认 10，上限 25）' },
+        repo: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'bridge_ring', description: '非阻塞查看门铃：立即返回是否有未消费的响铃（不等待）。',
+    inputSchema: { type: 'object', properties: { repo: { type: 'string' } } },
+  },
 ];
 
 const HANDLERS = {
@@ -555,6 +742,8 @@ const HANDLERS = {
   bridge_read: bridgeRead,
   bridge_reply: bridgeReply,
   bridge_ack: bridgeAck,
+  bridge_wait: bridgeWait,
+  bridge_ring: bridgeRing,
 };
 
 // ---------------------------------------------------------------------------
@@ -602,10 +791,17 @@ rl.on('line', (line) => {
     if (!handler) {
       return reply(id, { content: [{ type: 'text', text: JSON.stringify({ error: `未知工具: ${name}。可用工具：${Object.keys(HANDLERS).join(', ')}` }) }], isError: true });
     }
-    enqueue(() => Promise.resolve()
+    const run = () => Promise.resolve()
       .then(() => handler(args))
       .then((result) => reply(id, { content: [{ type: 'text', text: JSON.stringify(result) }] }))
-      .catch((err) => reply(id, { content: [{ type: 'text', text: JSON.stringify({ error: String(err?.message ?? err) }) }], isError: true })));
+      .catch((err) => reply(id, { content: [{ type: 'text', text: JSON.stringify({ error: String(err?.message ?? err) }) }], isError: true }));
+    // bridge_wait/bridge_ring 绕过串行队列：只读内存响铃缓冲、不碰游标文件，
+    // 阻塞等待期间同进程其他子代理的收发照常进行。
+    if (name === 'bridge_wait' || name === 'bridge_ring') {
+      run();
+      return;
+    }
+    enqueue(run);
     return;
   }
   return reply(id, null, new Error(`未知方法: ${method}`));

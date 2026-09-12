@@ -22,7 +22,8 @@ describe('协议层', () => {
       assert.equal(init.result.serverInfo.name, 'swarmbridge');
       const list = await c.rpc('tools/list', {});
       assert.deepEqual(list.result.tools.map(t => t.name).sort(), [
-        'bridge_ack', 'bridge_inbox', 'bridge_read', 'bridge_reply', 'bridge_send', 'bridge_status',
+        'bridge_ack', 'bridge_inbox', 'bridge_read', 'bridge_reply', 'bridge_ring',
+        'bridge_send', 'bridge_status', 'bridge_wait',
       ]);
     });
   });

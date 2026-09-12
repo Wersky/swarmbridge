@@ -2,7 +2,7 @@
 
 > 让两台机器上各自的 agent 与子代理，通过一个 GitHub 仓库**并行对话**：issue = 线程，评论 = 回帖，关闭 = 回执。
 
-[![tests](https://img.shields.io/badge/tests-17%20passed-brightgreen)](#测试)
+[![tests](https://img.shields.io/badge/tests-23%20passed-brightgreen)](#测试)
 [![deps](https://img.shields.io/badge/dependencies-0-brightgreen)](#设计取舍)
 [![node](https://img.shields.io/badge/node-%3E%3D18-blue)](https://nodejs.org)
 
@@ -18,8 +18,37 @@ SwarmBridge 把一个**双方都能访问的 GitHub 仓库**变成消息总线�
     └────────── 双方的子代理各自以子身份（owner/agent-N）参与 ──────────┘
 ```
 
-- **实时性（实测）**：GitHub 无法向本机推送（webhook 需要公网入口），采用游标增量轮询。真机实测：发出 → 对方轮询到 ≈ **5.3s**（1.5s 间隔轮询 4 次含网络往返）；回帖 → 对方看到 ≈ **0.9s**。已认证限额 5000 次/小时，多 agent 以 ≥1.5s 间隔轮询绰绰有余。
+- **实时性（实测）**：纯 GitHub 轮询模式，发出 → 对方轮询到 ≈ **3~8s**（瓶颈是 GitHub 对新线程的索引传播，2.5~7s）；**1.1.0 起默认叠加 ntfy 门铃推送，传播降到 ≈ 0.3s，单向总延迟 ≈ 0.9s**（见下文「门铃」）。已认证限额 5000 次/小时，多 agent 以 ≥1.5s 间隔轮询绰绰有余。
 - **为什么是 Issues 而不是仓库里的 JSON 文件**：追加式、服务端落库，**双方并发写零冲突**（git 提交方案要拉取-变基-重试，并发下必翻车）；自带 `updated_at` 时间戳（增量轮询）、评论线程（对话）、开关状态（回执），人类还能直接在网页上看懂并参与。
+
+## 门铃（ntfy 推送，1.1.0 默认开启）
+
+GitHub 无法向本机推送，轮询的等待时间受「轮询间隔 × 平台索引传播」双重拖累。1.1.0 引入门铃：**发完消息顺手向 ntfy 主题推一条「响铃」（仅元数据：issue 号/身份/类型，不含正文），对方的 server 进程常驻订阅该主题，铃一响立即拉取 GitHub。**
+
+```
+send ──▶ GitHub（事实源，含正文）──┐
+   └──▶ ntfy 响铃（≈0.3s）────────┴──▶ 对方 server 唤醒 → bridge_inbox 消费
+```
+
+- **实测**：铃的传播 **309ms**（中位，3 轮），单向总延迟 ≈ **0.9s**（对比纯轮询 3~8s）；
+- **零配置**：主题由仓库名自动派生（`swarmbridge-<hash>`），双端一致；也可用 `BRIDGE_NTFY_TOPIC` 指定（自建 ntfy 用 `BRIDGE_NTFY_URL`）；
+- **优雅降级**：门铃挂了/关了（`BRIDGE_NTFY_TOPIC=off`）只是退回慢速轮询，正确性不受影响——GitHub 是唯一事实源；
+- **两个使用工具**：
+  - `bridge_wait {timeout≤25}` —— 阻塞等铃（「发完任务等回复」场景），响铃即返回；不阻塞同进程其他代理的收发；
+  - `bridge_ring` —— 非阻塞查看有无未消费的铃；
+- 隐私边界：铃只含元数据且 ntfy 主题名公开可猜，**正文永远只在 GitHub**（私有仓库内容不上 ntfy）。
+
+## 自建中继（⚠️ 实验性，未实测）
+
+不想依赖 GitHub / 追求内网级延迟（10~200ms）时，可以用自带的独立中继：它实现 swarmbridge 所需的 GitHub API 子集，两端把 `BRIDGE_API_BASE` 指向它即可，**协议与工具完全不变**（门铃、游标、ack 全兼容）。
+
+```bash
+node relay/server.mjs --port 8787 --token <共享密钥> --data <数据目录>
+# 两端环境变量：
+BRIDGE_API_BASE=http://<中继地址>:8787   BRIDGE_TOKEN=<共享密钥>   BRIDGE_REPO=bridge/main
+```
+
+> ⚠️ **稳定性声明：中继组件没有经过真实的跨机部署测试**（作者只有单机环境，只做过本机回环验证）。单进程内存 + JSON 文件持久化，无 TLS，不适合多人生产。追求稳定请用默认的 GitHub 模式——把 `BRIDGE_API_BASE` 改回 `https://api.github.com` 即可无损切回，协议完全一致。
 
 ## 安装
 
@@ -43,6 +72,8 @@ git clone https://github.com/Wersky/swarmbridge.git
 | `bridge_read` | 读线程全文（首帖 + 全部回帖，人类普通评论也能读出） |
 | `bridge_reply` | 线程内回帖（自动回给发起方） |
 | `bridge_ack` | 确认已处理：回帖 + 关闭线程，对方看到 closed 即闭环 |
+| `bridge_wait` | **阻塞等铃**（ntfy 推送）：对方发消息即唤醒，≤25s，不阻塞同进程其他代理 |
+| `bridge_ring` | 非阻塞查看未消费的门铃 |
 
 消息信封（自动组装，人类可直接阅读）：
 
@@ -82,7 +113,7 @@ git clone https://github.com/Wersky/swarmbridge.git
 
 ## 测试
 
-17 个离线测试全绿（`npm test`）：本地 stub 模拟 GitHub API，覆盖收发闭环、寻址与通配、广播、排除自己、排除人类帖子、子身份、游标持久化与会话恢复、401/404/网络失败/消息过大等错误路径。测试基础设施自带进程收割，异常退出不留孤儿 node 进程。
+23 个离线测试全绿（`npm test`）：本地 stub 模拟 GitHub API，覆盖收发闭环、寻址与通配、广播、排除自己、排除人类帖子、子身份、游标持久化与会话恢复、401/404/网络失败/消息过大等错误路径。测试基础设施自带进程收割，异常退出不留孤儿 node 进程。
 
 另有真机验证脚本（默认跳过，避免无 token 环境跑挂）：
 
@@ -107,7 +138,7 @@ Subagents in coding agents (ZCode / Claude Code) are inherently isolated — no 
 
 **Why Issues instead of a JSON file in the repo**: appends are server-side with zero merge conflicts (a git-commit bus requires pull–rebase–retry and breaks under concurrency), `updated_at` enables cheap incremental polling, and comments/state give you threads and acks for free — plus humans can read and join on the web.
 
-17 offline tests (a local stub fakes the GitHub API) plus a gated live-roundtrip script.
+23 offline tests (a local stub fakes the GitHub API) plus gated live scripts.
 
 MIT © 2026 Wersky
 
