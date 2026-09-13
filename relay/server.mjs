@@ -65,32 +65,48 @@ try {
   if (raw && raw.issues) state = raw;
 } catch { /* 首次启动 */ }
 
-let saveTimer = null;
+/**
+ * 落盘策略：**每次变更立即写盘**（tmp→rename 原子替换）。
+ *
+ * 为什么不用防抖：Windows 上 Node 收不到 SIGTERM（`kill()` 直接终止进程），
+ * 防抖窗口内的写入会在进程被终止时丢失（实测：重启后数据全丢）。
+ * 中继是内网小服务、消息量小，同步写的开销可以接受——用一致性换性能。
+ */
 function save() {
-  // 防抖落盘：高频收发时不至于每条消息都写盘；进程退出前再兜底一次
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    try {
-      fs.mkdirSync(path.dirname(dataFile), { recursive: true });
-      const tmp = `${dataFile}.tmp-${process.pid}`;
-      fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
-      fs.renameSync(tmp, dataFile);
-    } catch (e) {
-      console.error('[relay] 落盘失败：', e.message);
-    }
-  }, 300);
+  try {
+    fs.mkdirSync(path.dirname(dataFile), { recursive: true });
+    const tmp = `${dataFile}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+    fs.renameSync(tmp, dataFile);
+  } catch (e) {
+    console.error('[relay] 落盘失败：', e.message);
+  }
 }
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
-    try {
-      fs.mkdirSync(path.dirname(dataFile), { recursive: true });
-      fs.writeFileSync(`${dataFile}.tmp-exit`, JSON.stringify(state, null, 2), 'utf8');
-      fs.renameSync(`${dataFile}.tmp-exit`, dataFile);
-    } catch { /* ignore */ }
-    process.exit(0);
-  });
+/**
+ * 退出兜底：把内存状态同步落盘。
+ *
+ * ⚠️ Windows 坑（实测踩过）：Node 在 Windows 上**不投递 SIGTERM** 给 JS 处理器
+ * （`child.kill()` 发 SIGTERM 等同于直接终止），因此这里必须同时挂 SIGBREAK
+ * 与 SIGINT；跨平台被强杀时数据仍可能丢最后一次防抖窗口。若要求更强一致性，
+ * 请把 save() 的防抖去掉（每条写盘）。
+ */
+function flush() {
+  try {
+    fs.mkdirSync(path.dirname(dataFile), { recursive: true });
+    fs.writeFileSync(`${dataFile}.tmp-exit`, JSON.stringify(state, null, 2), 'utf8');
+    fs.renameSync(`${dataFile}.tmp-exit`, dataFile);
+    console.log('[relay] 状态已落盘');
+  } catch (e) {
+    console.error('[relay] 退出落盘失败：', e.message);
+  }
 }
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) {
+  try {
+    process.on(sig, () => { flush(); process.exit(0); });
+  } catch { /* Windows 上部分信号不可注册 */ }
+}
+// 正常退出路径（process.exit / 事件循环排空）也要落盘
+process.on('exit', flush);
 
 // ---------------------------------------------------------------------------
 // HTTP 服务：实现 swarmbridge 需要的 GitHub API 子集

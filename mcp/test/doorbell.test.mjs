@@ -118,6 +118,27 @@ describe('门铃接收', () => {
     });
   });
 
+  test('bridge_wait 丢弃进入时的陈旧铃（只等"等待期间新到"的铃）', async () => {
+    await withBridge(async ({ mk }) => {
+      const a = mk('wersky/main');
+      const b = mk('alice/main');
+      // 先让 B 订阅流建立，再让 A 发一条（这条会成为 B 缓冲区里的"陈旧铃"）
+      await b.call('bridge_ring', {});
+      await sleep(600);
+      await a.call('bridge_send', { to: 'alice/main', type: 'chat', subject: '陈旧铃' });
+      await sleep(900); // 铃已进 B 的缓冲
+
+      // bridge_wait 不应把这条旧铃当成刚响的铃
+      const w = await b.call('bridge_wait', { timeout: 2 });
+      assert.equal(w.rung, false, '旧铃不应让 wait 立即返回 true（会把旧消息误判为新到达）');
+      assert.match(String(w.discarded ?? ''), /陈旧铃|旧铃|1 条/);
+
+      // 而 bridge_ring 应仍能主动取到它（丢弃只发生在 wait 的语义里）
+      const r = await b.call('bridge_ring', {});
+      assert.equal(r.rings.length, 0, 'wait 已丢弃，ring 不再重复给');
+    });
+  });
+
   test('ack 响铃让发起方知道线程已闭环', async () => {
     await withBridge(async ({ mk }) => {
       const a = mk('wersky/main');

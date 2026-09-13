@@ -164,7 +164,14 @@ export function startNtfyStub() {
       // POST /{topic} —— 发布门铃
       if (req.method === 'POST') {
         const list = topics.get(topic) ?? [];
-        const msg = { id: String(nextId++), time: Math.floor(Date.now() / 1000), event: 'message', message: Buffer.concat(chunks).toString('utf8') };
+        const msg = {
+          id: String(nextId++),
+          // 毫秒精度：server 端用发布时间与订阅时刻比较来丢弃重放的历史铃（见 subscribedAt），
+          // 秒级精度会让同秒内发布的铃被误判为历史（实测踩过）。
+          time: Date.now() / 1000,
+          event: 'message',
+          message: Buffer.concat(chunks).toString('utf8'),
+        };
         list.push(msg);
         topics.set(topic, list);
         broadcast(topic, msg);

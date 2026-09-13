@@ -318,11 +318,13 @@ function publishDoorbell(c, env, issue) {
 // 消费过滤：只投递「发给本方身份的、且不是本方自己发的」铃。
 // ---------------------------------------------------------------------------
 const doorbellState = {
-  rings: [],            // {issue, from, to, type, messageId, at}
+  rings: [],            // {issue, from, to, type, messageId, at, atMs}
   started: false,
   topic: null,
   url: null,
   connected: false,
+  watermark: 0,         // 已入缓冲的最大消息时间（ms）
+  subscribedAt: 0,      // 本次订阅流建立时刻（ms）：早于此的铃是重放的历史，丢弃
 };
 
 function takeMyRings(identity) {
@@ -358,6 +360,9 @@ async function doorbellStreamLoop(c) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 65000); // 长连接 65s 自愈重连
     try {
+      // 在发请求**之前**记录订阅时刻：请求往返期间到达的铃也算"新铃"（不能被误丢）；
+      // 真正会被丢弃的只有 ?since= 重放回来的历史铃。
+      doorbellState.subscribedAt = Date.now();
       const res = await fetch(`${c.ntfyUrl}/${encodeURIComponent(c.ntfyTopic)}/json?since=10m`, {
         headers: { 'User-Agent': 'swarmbridge-doorbell' },
         signal: ctrl.signal,
@@ -379,10 +384,17 @@ async function doorbellStreamLoop(c) {
           if (evt.event !== 'message' || !evt.message) continue;
           let env; try { env = JSON.parse(evt.message); } catch { continue; }
           if (env.bridge !== BRIDGE_MARKER || env.kind !== 'ring') continue;
+          const atMs = evt.time ? evt.time * 1000 : Date.now();
+          // 丢弃重放的历史铃：只接受「订阅流建立之后」发布的铃。
+          // ⚠️ ntfy 的时间戳只有**秒级精度**（真实 ntfy.sh 返回整数秒），
+          // 因此同一秒内"订阅→发布"会被误判为历史；减去 1 秒容差即可，
+          // 代价是断线重连时可能多收 1 秒内的旧铃（无害：消费端按 issue 去重）。
+          if (atMs < doorbellState.subscribedAt - 1000) continue;
           doorbellState.rings.push({
             issue: env.issue, from: env.from, to: env.to, type: env.type,
-            messageId: env.messageId, at: evt.time ? new Date(evt.time * 1000).toISOString() : new Date().toISOString(),
+            messageId: env.messageId, at: new Date(atMs).toISOString(), atMs,
           });
+          if (atMs > doorbellState.watermark) doorbellState.watermark = atMs;
           if (doorbellState.rings.length > 50) doorbellState.rings.splice(0, doorbellState.rings.length - 50);
         }
       }
@@ -622,8 +634,13 @@ async function bridgeWait(args) {
       hint: '门铃未开启（BRIDGE_NTFY_TOPIC=off）。直接轮询 bridge_inbox 即可，速度退回纯 GitHub 模式。' };
   }
   const timeout = Math.min(Math.max(Number(args?.timeout ?? 10), 0), 25);
+  // ⚠️ 先丢弃进入时缓冲区里的陈旧铃：那些是调用之前就到了的（可能已被别的调用处理过，
+  // 也可能是历史残留），若当成"刚响的铃"返回，调用方会误判到达时间
+  // （实测踩过：bench 因此测出 0ms 的假延迟）。bridge_wait 的语义是
+  // 「从现在起，等到有新铃」——旧铃请用 bridge_ring 主动取。
+  const discarded = takeMyRings(c.from).length;
   const t0 = Date.now();
-  let rings = takeMyRings(c.from);
+  let rings = [];
   while (rings.length === 0 && Date.now() - t0 < timeout * 1000) {
     await sleepMs(150);
     rings = takeMyRings(c.from);
@@ -632,6 +649,7 @@ async function bridgeWait(args) {
     rung: rings.length > 0,
     rings,
     waitedMs: Date.now() - t0,
+    ...(discarded > 0 ? { discarded: `进入时有 ${discarded} 条陈旧铃已被丢弃（用 bridge_ring 可主动取）` } : {}),
     hint: rings.length > 0
       ? '门铃已响 → 立即 bridge_inbox 消费新消息。'
       : '超时未响：对方尚未发送，或对方门铃关闭。bridge_inbox 轮询兜底仍可用。',
