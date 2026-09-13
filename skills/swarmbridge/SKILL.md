@@ -17,8 +17,10 @@ taskswarm 让**本机**的主代理与子代理互通（共享看板）；但两
 
 - **issue = 线程**（首帖是信封 JSON），**评论 = 回帖**，**关闭 = 接收方回执（ack）**；
 - 身份是 `owner/role` 形式：主代理 `Wersky/main`，子代理 `Wersky/agent-1`；
-- 类型约定：`hello`(握手) / `chat`(沟通) / `task`(委派任务，data 放 {goal,detail}) / `status`(进展) / `result`(结果，data 放产物) / `file`(交付) / `bye`(收工)；也可自定义，双方按约定理解；
+- 类型约定：`hello`(握手) / `chat`(沟通) / `task`(委派任务，data 放 {goal,detail}) / `plan`(**PPR 计划**，data 放 {plan:[{id,title,role,reviewer,dependsOn}], reviewer}) / `status`(进展) / `result`(结果，data 放产物) / `file`(交付) / `bye`(收工)；也可自定义，双方按约定理解；
+- **`plan` 类型的 data 会被强校验**：`plan` 必须是非空数组、每项必须有 `title`、`role` 必须是 planner/producer/reviewer。写错会直接报错并指出是第几项——因为对方收到后要照它建本地任务树，字段漂移会静默降级成普通消息、审核门白设。
 - 广播 `to: "*"`；发给对方全体 `to: "Alice/*"`；精确点名 `to: "Alice/agent-2"`。
+- **寻址是「子可见父、父不可见子」**：发给 `Alice/main` 的消息，对方的子身份（`Alice/agent-9`）也能收到——这是 PPR 的前提（计划发给主身份，审核由子代理担任）；反之给 `Alice/agent-2` 的私聊不会出现在 `Alice/main` 或兄弟身份的收件箱（精确投递隔离保留）。
 
 ## 前置配置（缺一不可）
 

@@ -37,7 +37,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import readline from 'node:readline';
 
-const SERVER_VERSION = '1.1.0'; // 必须与 package.json / .zcode-plugin/plugin.json 一致
+const SERVER_VERSION = '1.2.0'; // 必须与 package.json / .zcode-plugin/plugin.json 一致
 const BRIDGE_MARKER = 1;            // 信封协议版本号（body.bridge === 1 才算本桥消息）
 const MAX_BODY_CHARS = 60000;       // GitHub issue/comment 正文上限 65536，留余量
 const INBOX_PAGE = 100;             // 单次拉取上限（GitHub per_page 最大 100）
@@ -95,11 +95,38 @@ function cursorFile(args, identity) {
 //   "wersky/*"   → 同上（显式通配写法）
 //   "wersky/agent-1" → 精确匹配
 // ---------------------------------------------------------------------------
+/**
+ * 收件匹配：判断信封的 to 是否应投递给 myId。
+ *
+ * 规则：
+ *   "*"                → 所有人
+ *   "alice"            → alice 及其全部子身份（父收子，便于主身份汇总）
+ *   "alice/*"          → 同上
+ *   "alice/agent-9"    → 精确命中，且 **只有 alice/agent-9 与 alice/main 之外的拥有者收不到**
+ *   "alice/main"       → alice/agent-9 等子身份**也能收到**（子可见父）
+ *
+ * 关键不对称：**子可见父，父不可见子**。
+ *   - 子可见父是 PPR 的前提：计划发给「对方主身份」（alice/main），
+ *     而执行/审核由子代理担任（alice/agent-1 干活、alice/agent-9 审核）；
+ *     若子身份看不到发给主身份的消息，PPR 就必须靠主代理手工转发，无法自动闭环。
+ *   - 父不可见子是保留精确投递的隔离性：给 alice/agent-9 的私聊
+ *     不应出现在 alice/main 或 alice/agent-1 的收件箱里（谁被点名谁处理）。
+ *   - 广播 "alice/*" 与父身份 "alice" 仍然覆盖全体（那是显式群发语义）。
+ */
 function toMatches(to, myId) {
   if (!to || to === '*') return true;
   if (to === myId) return true;
-  if (myId.startsWith(to + '/')) return true;          // "wersky" 匹配 "wersky/agent-1"
-  if (to.endsWith('/*') && myId.startsWith(to.slice(0, -1))) return true; // "wersky/*"
+  if (myId.startsWith(to + '/')) return true;          // 父身份代收子身份的消息（父收子）
+  if (to.endsWith('/*') && myId.startsWith(to.slice(0, -1))) return true; // "alice/*"
+  // 子可见父：myId 是子身份（含 "/"），且 to 是同 owner 的**父/兄弟**身份时，
+  // 仅当 to 指向该 owner 的主身份（形如 "alice/main" 或不带子段）才投递。
+  // 这样 "alice/main" 的消息子身份能收到，而 "alice/agent-1" 的私聊不会外泄给兄弟。
+  const myOwner = myId.includes('/') ? myId.slice(0, myId.indexOf('/')) : myId;
+  const toOwner = to.includes('/') ? to.slice(0, to.indexOf('/')) : to;
+  if (myOwner === toOwner && myId.includes('/')) {
+    const toRole = to.includes('/') ? to.slice(to.indexOf('/') + 1) : '';
+    if (toRole === '' || toRole === 'main') return true; // 发给 owner 或 owner/main → 全体子身份可见
+  }
   return false;
 }
 
@@ -224,19 +251,68 @@ async function gh(method, apiPath, { token, apiBase, body } = {}) {
 // issue/comment 的正文就是一份 JSON 信封（人类可读的 pretty JSON）。
 // 只认 body.bridge === 1 的内容为桥消息——人类手写的 issue 不会进 agent 收件箱。
 // ---------------------------------------------------------------------------
+/** PPR 角色取值（与 taskswarm 的 TASK_ROLES 保持一致） */
+const PLAN_ROLES = ['planner', 'producer', 'reviewer'];
+
+/**
+ * plan 类型消息的结构校验（PPR：Planner 出计划 → 分工给 Producer → 指定 Reviewer 审核）。
+ *
+ * 为什么强制校验：type 本身是自由字符串，任何结构化约定都会随使用漂移。
+ * plan 是**跨机器编排的核心载体**——对方收到后要照它建本地任务树（taskswarm 的
+ * role/reviewer 字段），字段对不上就会静默降级成普通聊天消息、审核门白设。
+ * 因此这里在发送端就把格式卡住，错误信息直指缺哪个字段。
+ *
+ * 规范：data = {
+ *   plan: [ { id, title, detail?, dependsOn?[], role?, reviewer? } ],   // 必填，非空数组
+ *   reviewer?: string,        // 可选：整份计划的默认审核者（子项未指定 reviewer 时继承）
+ *   producer?: string         // 可选：默认执行者身份（子项未指定时的归属提示）
+ * }
+ */
+function assertPlanShape(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('plan 消息的 data 必须是对象。下一步：写成 {"plan":[{...}]} 形式（plan 为任务数组）。');
+  }
+  if (!Array.isArray(data.plan) || data.plan.length === 0) {
+    throw new Error('plan 消息的 data.plan 必须是非空数组。下一步：每个子项写成 {"title":"做什么","role":"producer","reviewer":"alice/main"}；role 取值 planner/producer/reviewer，reviewer 填身份字符串即启用审核门。');
+  }
+  data.plan.forEach((item, i) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error(`plan 消息的 data.plan[${i}] 必须是对象。下一步：写成 {"title":"...","role":"producer"}。`);
+    }
+    if (String(item.title ?? '').trim() === '') {
+      throw new Error(`plan 消息的 data.plan[${i}] 缺少 title。下一步：为每个子项写明"做什么"（一句话）。`);
+    }
+    if (item.role !== undefined && item.role !== null && String(item.role).trim() !== '') {
+      const r = String(item.role).trim().toLowerCase();
+      if (!PLAN_ROLES.includes(r)) {
+        throw new Error(`plan 消息的 data.plan[${i}].role 非法（收到 "${item.role}"）。下一步：改用 ${PLAN_ROLES.join(' / ')} 之一。`);
+      }
+    }
+    if (item.dependsOn !== undefined && item.dependsOn !== null && !Array.isArray(item.dependsOn)) {
+      throw new Error(`plan 消息的 data.plan[${i}].dependsOn 必须是字符串数组。下一步：写成 {"dependsOn":["T1"]} 或省略。`);
+    }
+  });
+  if (data.reviewer !== undefined && data.reviewer !== null && String(data.reviewer).trim() !== '' && String(data.reviewer).length > 80) {
+    throw new Error(`plan 消息的 data.reviewer 身份过长（${String(data.reviewer).length} > 80）。下一步：用简短身份，如 "alice/main"。`);
+  }
+  return true;
+}
+
 function makeEnvelope({ from, to, type, subject, body, data, inReplyTo }) {
   if (!to) {
     throw new Error('缺少 to。下一步：填收件方身份（如 "alice/main"），发给对方全部代理用 "alice/*"，广播用 "*"。');
   }
   if (!type) {
-    throw new Error('缺少 type。下一步：从约定类型里选一个：hello(握手) / chat(自由沟通) / task(委派任务) / status(进展) / result(结果) / file(产物交付) / bye(收工)；也可以自定义，接收方按约定理解。');
+    throw new Error('缺少 type。下一步：从约定类型里选一个：hello(握手) / chat(自由沟通) / task(委派任务) / plan(PPR 计划) / status(进展) / result(结果) / file(产物交付) / bye(收工)；也可以自定义，接收方按约定理解。');
   }
+  const t = String(type).trim();
+  if (t === 'plan') assertPlanShape(data);   // 计划是跨机器编排载体，格式必须卡住
   const env = {
     bridge: BRIDGE_MARKER,
     id: crypto.randomUUID(),
     from,
     to,
-    type: String(type).trim(),
+    type: t,
     subject: String(subject ?? '').slice(0, 200),
     body: String(body ?? ''),
     ...(data !== undefined ? { data } : {}),
@@ -724,15 +800,15 @@ const TOOLS = [
     },
   },
   {
-    name: 'bridge_send', description: '给对方 agent 发消息（新建线程）。type 约定：hello/chat/task/status/result/file/bye。',
+    name: 'bridge_send', description: '给对方 agent 发消息（新建线程）。type 约定：hello/chat/task/plan/status/result/file/bye。type=plan 时为 PPR 计划，data 必须形如 {plan:[{id,title,detail?,dependsOn?,role?,reviewer?}], reviewer?, producer?}——对方会照它建本地任务树（含审核门）。',
     inputSchema: {
       type: 'object', required: ['to', 'type'],
       properties: {
         to: { type: 'string', description: '收件方身份，如 "alice/main"；发给对方全部子代理用 "alice/*"；广播用 "*"' },
-        type: { type: 'string', description: '消息类型：hello/chat/task/status/result/file/bye 或自定义' },
+        type: { type: 'string', description: '消息类型：hello/chat/task/plan/status/result/file/bye 或自定义' },
         subject: { type: 'string', description: '一句话主题' },
         body: { type: 'string', description: '正文（自由文本）' },
-        data: { type: 'object', description: '结构化负载（如 task 的 {goal,detail}，result 的 {artifacts:[...]}）' },
+        data: { type: 'object', description: '结构化负载。task: {goal,detail}；plan（PPR 计划）: {plan:[{id,title,detail?,dependsOn?,role?,reviewer?}], reviewer?, producer?}；result: {artifacts:[...]}' },
         from: { type: 'string', description: '发件身份覆盖（默认 BRIDGE_ID）。子代理用 "wersky/agent-1" 这类子身份' },
         repo: { type: 'string', description: '覆盖 BRIDGE_REPO（"owner/name"）' },
       },

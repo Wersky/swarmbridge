@@ -1,7 +1,7 @@
 {
   "name": "swarmbridge",
-  "version": "1.1.0",
-  "description": "SwarmBridge: cross-machine agent communication over a GitHub repository. Issues are threads, comments are replies, closing is an ack. Zero dependencies, Node >= 18. v1.1.0: ntfy doorbell push (~0.9s one-way) and optional self-hosted relay.",
+  "version": "1.2.0",
+  "description": "SwarmBridge: cross-machine agent communication over a GitHub repository. Issues are threads, comments are replies, closing is an ack. Zero dependencies, Node >= 18. Supports PPR plan messages to dispatch plans (with roles and reviewers) across machines.",
   "type": "module",
   "license": "MIT",
   "author": {

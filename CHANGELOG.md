@@ -2,6 +2,27 @@
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+## [1.2.0] - 2026-09-13
+
+### Added
+
+- **`plan` 消息类型（PPR 计划的跨机器载体）**：`data = {plan:[{id,title,detail?,dependsOn?,role?,reviewer?}],
+  reviewer?, producer?}`。发送端强校验结构（非空数组、每项必带 title、role 取值受限），
+  错误信息指出是第几项——对方收到后要照它建本地任务树，字段漂移会让审核门白设。
+- 与 taskswarm 的 PPR 打通：收到 `plan` 后把子项转成本地 `plan_create` 任务（`role`/`reviewer` 原样带入），
+  本地走审核门，完成后 `bridge_reply {type:"result"}` 回报、`bridge_ack` 闭环。
+
+### Fixed
+
+- **子身份看不到发给主身份的消息**（真机验证暴露的设计缺口）：计划通常发给 `alice/main`，
+  而执行/审核由子代理担任（`alice/agent-1` 干活、`alice/agent-9` 审核）——原寻址规则下
+  审核者根本收不到计划，PPR 无法自动闭环。
+  现改为**「子可见父、父不可见子」**：发给 `alice/main` 的消息子身份也能收到；
+  而点名 `alice/agent-2` 的私聊仍不会外泄给主身份或兄弟身份（精确投递隔离保留）。
+
+
 ## [1.1.0] - 2026-09-13
 
 ### Added

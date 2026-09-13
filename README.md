@@ -50,6 +50,14 @@ BRIDGE_API_BASE=http://<中继地址>:8787   BRIDGE_TOKEN=<共享密钥>   BRIDG
 
 > ⚠️ **稳定性声明：中继组件没有经过真实的跨机部署测试**（作者只有单机环境，只做过本机回环验证）。单进程内存 + JSON 文件持久化，无 TLS，不适合多人生产。追求稳定请用默认的 GitHub 模式——把 `BRIDGE_API_BASE` 改回 `https://api.github.com` 即可无损切回，协议完全一致。
 
+## PPR 计划分发（1.2.0）
+
+`type: "plan"` 用于**跨机器分发 PPR 计划**：`data = {plan:[{id,title,detail?,dependsOn?,role?,reviewer?}], reviewer?, producer?}`。
+
+发送端强校验结构（非空数组、每项必带 title、`role` 限于 planner/producer/reviewer），错误会指出是第几项。对方收到后照它建本地任务树（taskswarm 的 `role`/`reviewer` 原样带入），本地审核门自动生效，完成后 `bridge_reply {type:"result"}` 回报、`bridge_ack` 闭环。
+
+**寻址是「子可见父、父不可见子」**：发给 `alice/main` 的消息，子身份（`alice/agent-9`）也能收到——这是 PPR 的前提（计划发给主身份，审核由子代理担任）；而点名 `alice/agent-2` 的私聊不会外泄给主身份或兄弟身份。
+
 ## 安装
 
 需要 Node ≥ 18，零第三方依赖。

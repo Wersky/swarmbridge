@@ -219,6 +219,34 @@ describe('寻址与过滤', () => {
     });
   });
 
+  test('★ 子可见父、父不可见子（PPR 前提 + 精确投递隔离）', async () => {
+    await withBridge(async ({ mk }) => {
+      const main = mk('alice/main');
+      const sub1 = mk('alice/agent-1');
+      const sub9 = mk('alice/agent-9');
+      const peer = mk('wersky/main');
+
+      // 1) 发给主身份的消息：子身份也应收到（否则 PPR 无法自动闭环）
+      await peer.call('bridge_send', { to: 'alice/main', type: 'plan', subject: '给主身份的计划', data: { plan: [{ title: 'x', reviewer: 'alice/agent-9' }] } });
+      await sleep(1200);
+      const inSub9 = await sub9.call('bridge_inbox', {});
+      assert.ok(inSub9.messages.some(m => m.subject === '给主身份的计划'),
+        '发给 alice/main 的消息必须能被 alice/agent-9 收到（审核者要能看到计划）');
+
+      // 2) 点名给某个子身份的私聊：其他子身份与主身份都不应收到（隔离保留）
+      await peer.call('bridge_send', { to: 'alice/agent-1', type: 'chat', subject: '只给 agent-1' });
+      await sleep(1200);
+      const inMain2 = await main.call('bridge_inbox', {});
+      assert.ok(!inMain2.messages.some(m => m.subject === '只给 agent-1'),
+        '点名子身份的消息不应出现在主身份收件箱');
+      const inSub9b = await sub9.call('bridge_inbox', {});
+      assert.ok(!inSub9b.messages.some(m => m.subject === '只给 agent-1'),
+        '点名 agent-1 的消息不应被兄弟身份 agent-9 看到');
+      const inSub1 = await sub1.call('bridge_inbox', {});
+      assert.ok(inSub1.messages.some(m => m.subject === '只给 agent-1'), '被点名的子身份应收到');
+    });
+  });
+
   test('子代理用 from 覆盖身份发消息（跨方并行沟通的基础）', async () => {
     await withBridge(async ({ mk }) => {
       const a = mk('wersky/main');
