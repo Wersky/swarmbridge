@@ -14,12 +14,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { withBridge, connect, makeWorkspace, rmWorkspace } from './helpers.mjs';
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 describe('协议层', () => {
   test('initialize 与 tools/list（6 个工具）', async () => {
     await withBridge(async ({ mk }) => {
       const c = mk('wersky/main');
       const init = await c.rpc('initialize', {});
       assert.equal(init.result.serverInfo.name, 'swarmbridge');
+      // 版本号必须与 manifest 一致：曾出现 serverInfo 报 1.0.0 而 manifest 已是 1.1.0 的漂移
+      const { readFileSync } = await import('node:fs');
+      const { fileURLToPath } = await import('node:url');
+      const path = await import('node:path');
+      const here = path.dirname(fileURLToPath(import.meta.url));
+      const manifest = JSON.parse(readFileSync(path.resolve(here, '..', '..', '.zcode-plugin', 'plugin.json'), 'utf8'));
+      assert.equal(init.result.serverInfo.version, manifest.version,
+        'serverInfo.version 必须与 plugin.json 一致，否则升级会漏改');
       const list = await c.rpc('tools/list', {});
       assert.deepEqual(list.result.tools.map(t => t.name).sort(), [
         'bridge_ack', 'bridge_inbox', 'bridge_read', 'bridge_reply', 'bridge_ring',
@@ -111,6 +121,31 @@ describe('收发闭环', () => {
       const threadAfter = await a.call('bridge_read', { issue: sent.issue });
       assert.equal(threadAfter.state, 'closed');
       assert.equal(threadAfter.replies.at(-1).type, 'ack');
+    });
+  });
+
+  test('limit 截断时游标不越界：未返回的消息在下次轮询仍能拿到（不静默丢失）', async () => {
+    await withBridge(async ({ mk }) => {
+      const a = mk('wersky/main');
+      const b = mk('alice/main');
+      // 造 3 条消息，然后用小 limit 分两批取
+      for (const s of ['m1', 'm2', 'm3']) {
+        await a.call('bridge_send', { to: 'alice/main', type: 'chat', subject: s });
+        await sleep(30);
+      }
+
+      const p1 = await b.call('bridge_inbox', { limit: 2 });
+      assert.equal(p1.count, 2, '第一批应返回 limit 条');
+
+      const p2 = await b.call('bridge_inbox', { limit: 2 });
+      assert.equal(p2.count, 1, '第二批应返回剩余 1 条（游标未越过未读消息）');
+
+      const p3 = await b.call('bridge_inbox', {});
+      assert.equal(p3.count, 0, '三批后应无剩余');
+
+      // 核心承诺：两批合起来恰好三条、无重复无丢失（不依赖具体返回顺序）
+      const all = [...p1.messages, ...p2.messages].map(m => m.subject).sort();
+      assert.deepEqual(all, ['m1', 'm2', 'm3'], '分页取完三条消息，无重复、无静默丢失');
     });
   });
 

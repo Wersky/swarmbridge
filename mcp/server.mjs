@@ -37,7 +37,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import readline from 'node:readline';
 
-const SERVER_VERSION = '1.0.0';
+const SERVER_VERSION = '1.1.0'; // 必须与 package.json / .zcode-plugin/plugin.json 一致
 const BRIDGE_MARKER = 1;            // 信封协议版本号（body.bridge === 1 才算本桥消息）
 const MAX_BODY_CHARS = 60000;       // GitHub issue/comment 正文上限 65536，留余量
 const INBOX_PAGE = 100;             // 单次拉取上限（GitHub per_page 最大 100）
@@ -324,7 +324,7 @@ const doorbellState = {
   url: null,
   connected: false,
   watermark: 0,         // 已入缓冲的最大消息时间（ms）
-  subscribedAt: 0,      // 本次订阅流建立时刻（ms）：早于此的铃是重放的历史，丢弃
+  seenIds: new Set(),   // 已入缓冲的 messageId：挡住 ntfy 重放导致的重复铃
 };
 
 function takeMyRings(identity) {
@@ -360,9 +360,6 @@ async function doorbellStreamLoop(c) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 65000); // 长连接 65s 自愈重连
     try {
-      // 在发请求**之前**记录订阅时刻：请求往返期间到达的铃也算"新铃"（不能被误丢）；
-      // 真正会被丢弃的只有 ?since= 重放回来的历史铃。
-      doorbellState.subscribedAt = Date.now();
       const res = await fetch(`${c.ntfyUrl}/${encodeURIComponent(c.ntfyTopic)}/json?since=10m`, {
         headers: { 'User-Agent': 'swarmbridge-doorbell' },
         signal: ctrl.signal,
@@ -385,11 +382,16 @@ async function doorbellStreamLoop(c) {
           let env; try { env = JSON.parse(evt.message); } catch { continue; }
           if (env.bridge !== BRIDGE_MARKER || env.kind !== 'ring') continue;
           const atMs = evt.time ? evt.time * 1000 : Date.now();
-          // 丢弃重放的历史铃：只接受「订阅流建立之后」发布的铃。
-          // ⚠️ ntfy 的时间戳只有**秒级精度**（真实 ntfy.sh 返回整数秒），
-          // 因此同一秒内"订阅→发布"会被误判为历史；减去 1 秒容差即可，
-          // 代价是断线重连时可能多收 1 秒内的旧铃（无害：消费端按 issue 去重）。
-          if (atMs < doorbellState.subscribedAt - 1000) continue;
+          // 按 messageId 去重：ntfy 的 ?since= 重放会把历史铃再推一遍
+          // （断线重连场景），这里用已见过的 id 集合挡住，避免同一条铃重复入缓冲。
+          // 不用时间戳判断新旧——ntfy 时间戳只有秒级精度，且"对方先发、我稍后订阅"
+          // 是正常时序，按时间过滤会误杀真实的新铃（实测踩过两次）。
+          if (doorbellState.seenIds.has(env.messageId)) continue;
+          doorbellState.seenIds.add(env.messageId);
+          if (doorbellState.seenIds.size > 200) {
+            // 简易限容：保留最近 200 个 id
+            doorbellState.seenIds = new Set([...doorbellState.seenIds].slice(-100));
+          }
           doorbellState.rings.push({
             issue: env.issue, from: env.from, to: env.to, type: env.type,
             messageId: env.messageId, at: new Date(atMs).toISOString(), atMs,
@@ -478,7 +480,11 @@ async function bridgeInbox(args) {
   // 类型筛选由调用方在返回结果里自行做（messages 里带 type 字段）。
   const limit = Math.max(1, Math.min(Number(args?.limit ?? 20), 100));
 
-  const list = await gh('GET', `${repoBase(c.repo)}/issues?state=all&sort=updated&direction=desc&since=${encodeURIComponent(since)}&per_page=${INBOX_PAGE}`, {
+  // ⚠️ GitHub 的 sort=updated 在多页/大量数据时不可靠（实测：direction=asc 会退化成按
+  // issue 号排序，导致刚发的消息排不进返回页），因此改为**按创建时间降序拉取**
+  // （created 顺序稳定），再在本地按 updated_at 排序与截断。
+  // 拉取量设大一些，保证近期的活跃线程都在窗口内。
+  const list = await gh('GET', `${repoBase(c.repo)}/issues?state=all&sort=created&direction=desc&per_page=${INBOX_PAGE}`, {
     token: c.token, apiBase: c.apiBase,
   });
 
@@ -487,8 +493,13 @@ async function bridgeInbox(args) {
   for (const item of Array.isArray(list) ? list : []) {
     if (item.pull_request) continue;                     // PR 不是桥消息
     if (item.updated_at && item.updated_at > maxUpdated) maxUpdated = item.updated_at;
+    // 拉取下界：仅在**首次使用**（尚无 seen 记录）时用 24h 默认值挡掉陈年历史；
+    // 一旦有了处理记录，去重完全交给 seen 表——不再用时间过滤，
+    // 否则未返回（被 limit 截断）的更早消息会被 since 永久挡在候选之外（实测踩过）。
+    const hasHistory = Object.keys(seen).length > 0;
+    if (!hasHistory && item.updated_at && item.updated_at < since) continue;
     const known = seen[item.number];
-    if (known && known >= item.updated_at) continue;     // 游标内已处理过
+    if (known && known >= item.updated_at) continue;     // 已处理过
     const env = parseEnvelope(item.body ?? '');
     if (!env) continue;                                  // 人类手写的 issue，不进收件箱
 
@@ -502,7 +513,8 @@ async function bridgeInbox(args) {
     // 自己的回帖/ack 造成的更新已在 noteOwnActivity 记账，不会回声。
     if (env.from === c.from && !(item.comments > 0)) continue;
 
-    seen[item.number] = item.updated_at;
+    // ⚠️ 此处**不**写 seen：先收集候选，只有真正返回给调用方的才标记为已处理。
+    // 若在这里就标记，被 limit 截断（未返回）的消息下轮会被 seen 跳过 → 静默丢失（实测踩过）。
     messages.push({
       issue: item.number,
       messageId: env.id,
@@ -518,7 +530,32 @@ async function bridgeInbox(args) {
       updatedAt: item.updated_at,
       url: item.html_url,
     });
-    if (messages.length >= limit) break;
+    // 注意：这里**不**按 limit 提前 break —— 先收集全部候选，排序后再截断。
+    // 原因：拉取顺序（created desc）≠ 对外顺序（updated desc），提前 break 会把
+    // 更新的线程挡在截断线外（实测踩过：inbox 只返回最旧的 20 条，新消息被丢弃）。
+  }
+
+  // 排序 + 截断：对外按 updated_at 降序（最新在前），超出 limit 的留在下一轮。
+  // 遍历顺序取决于 GitHub 返回顺序（created desc），不能假定它与 updated_at 一致；
+  // 曾用 reverse() 想当然倒序、且在正确排序前就 break，导致返回最旧的 20 条、
+  // 新消息被截断线排除（实测：bridge_inbox 看不到刚发的消息）。
+  messages.sort((a, b) => (a.updatedAt === b.updatedAt ? 0 : (a.updatedAt < b.updatedAt ? 1 : -1)));
+  const returned = messages.slice(0, limit);
+  const remaining = messages.length - returned.length;
+  let cursorTo = since; // 下一轮的拉取下界（下面按实际返回的消息推进）
+
+  // 游标语义（实测踩过后重写）：
+  //   - `seen` 表是**真正的去重依据**（按 issue 记已处理到的 updated_at）；
+  //   - `since` 只是「拉取范围下界」，用于让 GitHub 端少返回历史数据。
+  // 关键约束：**只为实际返回的消息推进 seen/since**。若把未返回的也标记为已处理，
+  // 它们会被永久跳过、静默丢失（这正是下面 remaining 分支存在的理由）。
+  if (returned.length > 0) {
+    // 下界取「本批最旧一条的时间」：比它更早的（未返回的）下轮仍会被拉取，
+    // 已返回的由 seen 表挡住不会重复投递。
+    const oldest = returned[returned.length - 1].updatedAt;
+    cursorTo = oldest;
+    // 只有实际交付的消息才计入 seen（见上方"不写 seen"的注释）
+    for (const m of returned) seen[m.issue] = m.updatedAt;
   }
 
   // 游标去重表限容：丢最旧的
@@ -526,14 +563,16 @@ async function bridgeInbox(args) {
   if (keys.length > SEEN_LIMIT) {
     for (const k of keys.slice(0, keys.length - SEEN_LIMIT)) delete seen[k];
   }
-  saveCursor(args, c.from, maxUpdated, seen);
+  saveCursor(args, c.from, cursorTo, seen);
 
   return {
     identity: c.from,
-    count: messages.length,
-    messages,                                          // 按更新时间降序
-    since: maxUpdated,
-    hint: messages.length > 0
+    count: returned.length,
+    ...(remaining > 0 ? { remaining, hintMore: `还有 ${remaining} 条更早的消息未返回，下次轮询 bridge_inbox 会继续给出` } : {}),
+    ...(list.length >= INBOX_PAGE ? { truncated: `本页已达 ${INBOX_PAGE} 条上限，更早的消息会在下次轮询继续返回` } : {}),
+    messages: returned,                                // 按更新时间降序（最新在前）
+    since: cursorTo,
+    hint: returned.length > 0
       ? '用 bridge_read(issue) 读线程全文；处理完用 bridge_ack(issue) 关闭线程给对方回执。'
       : '暂无新消息。对方发出的消息要等它轮询 bridge_inbox 才会被看到；保持轮询节奏（建议 ≥5s）。',
   };
@@ -634,13 +673,16 @@ async function bridgeWait(args) {
       hint: '门铃未开启（BRIDGE_NTFY_TOPIC=off）。直接轮询 bridge_inbox 即可，速度退回纯 GitHub 模式。' };
   }
   const timeout = Math.min(Math.max(Number(args?.timeout ?? 10), 0), 25);
-  // ⚠️ 先丢弃进入时缓冲区里的陈旧铃：那些是调用之前就到了的（可能已被别的调用处理过，
-  // 也可能是历史残留），若当成"刚响的铃"返回，调用方会误判到达时间
-  // （实测踩过：bench 因此测出 0ms 的假延迟）。bridge_wait 的语义是
-  // 「从现在起，等到有新铃」——旧铃请用 bridge_ring 主动取。
-  const discarded = takeMyRings(c.from).length;
   const t0 = Date.now();
-  let rings = [];
+  // 语义：等到「缓冲区里有铃」即返回。
+  //
+  // ⚠️ 刻意**不**在进入时丢弃已缓冲的铃：真实时序常常是
+  //   「对方先发布 → 我稍后才调用 bridge_wait」，
+  // 若把进入时已有的铃当"陈旧"丢掉，这条真实的新消息就永远等不到（实测踩过：
+  // 已安装插件验证里等满 20s 超时，而铃其实早在 ntfy 上了）。
+  // 重复消费由两道保险挡住：门铃按 messageId 去重（同一条铃不会重复入缓冲）、
+  // bridge_inbox 按游标去重（已处理的消息不会重复出现）。
+  let rings = takeMyRings(c.from);
   while (rings.length === 0 && Date.now() - t0 < timeout * 1000) {
     await sleepMs(150);
     rings = takeMyRings(c.from);
@@ -649,7 +691,6 @@ async function bridgeWait(args) {
     rung: rings.length > 0,
     rings,
     waitedMs: Date.now() - t0,
-    ...(discarded > 0 ? { discarded: `进入时有 ${discarded} 条陈旧铃已被丢弃（用 bridge_ring 可主动取）` } : {}),
     hint: rings.length > 0
       ? '门铃已响 → 立即 bridge_inbox 消费新消息。'
       : '超时未响：对方尚未发送，或对方门铃关闭。bridge_inbox 轮询兜底仍可用。',

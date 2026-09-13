@@ -118,24 +118,33 @@ describe('门铃接收', () => {
     });
   });
 
-  test('bridge_wait 丢弃进入时的陈旧铃（只等"等待期间新到"的铃）', async () => {
+  test('bridge_wait 语义：对方先发、我后 wait 也能等到（真实时序）', async () => {
     await withBridge(async ({ mk }) => {
       const a = mk('wersky/main');
       const b = mk('alice/main');
-      // 先让 B 订阅流建立，再让 A 发一条（这条会成为 B 缓冲区里的"陈旧铃"）
-      await b.call('bridge_ring', {});
-      await sleep(600);
-      await a.call('bridge_send', { to: 'alice/main', type: 'chat', subject: '陈旧铃' });
-      await sleep(900); // 铃已进 B 的缓冲
+      // 关键时序：A 先发，B 稍后才 wait（此时 B 的订阅流才建立，铃会经重放到达）
+      await a.call('bridge_send', { to: 'alice/main', type: 'chat', subject: '先发后等' });
+      await sleep(500);
 
-      // bridge_wait 不应把这条旧铃当成刚响的铃
-      const w = await b.call('bridge_wait', { timeout: 2 });
-      assert.equal(w.rung, false, '旧铃不应让 wait 立即返回 true（会把旧消息误判为新到达）');
-      assert.match(String(w.discarded ?? ''), /陈旧铃|旧铃|1 条/);
+      const w = await b.call('bridge_wait', { timeout: 8 });
+      assert.equal(w.rung, true, '对方已发的消息必须能被 wait 等到（曾因按时间过滤误杀真实新铃而超时）');
+      assert.ok(w.rings.length >= 1 && Number.isInteger(w.rings[0].issue), '铃应带合法的 issue 编号');
+    });
+  });
 
-      // 而 bridge_ring 应仍能主动取到它（丢弃只发生在 wait 的语义里）
-      const r = await b.call('bridge_ring', {});
-      assert.equal(r.rings.length, 0, 'wait 已丢弃，ring 不再重复给');
+  test('门铃去重：同一条铃不会重复入缓冲（ntfy 重放被 messageId 挡住）', async () => {
+    await withBridge(async ({ mk, ntfy }) => {
+      const a = mk('wersky/main');
+      const b = mk('alice/main');
+      await b.call('bridge_ring', {}); // 建立订阅流
+      await sleep(500);
+      const sent = await a.call('bridge_send', { to: 'alice/main', type: 'chat', subject: '去重测试' });
+      await sleep(900);
+
+      const first = await b.call('bridge_ring', {});
+      const ids = first.rings.map(r => r.messageId);
+      assert.equal(new Set(ids).size, ids.length, '缓冲内不应有重复 messageId');
+      assert.ok(ids.length >= 1);
     });
   });
 
