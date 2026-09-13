@@ -1,6 +1,6 @@
 {
   "name": "swarmbridge",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "SwarmBridge: cross-machine agent communication over a GitHub repository. Issues are threads, comments are replies, closing is an ack. Zero dependencies, Node >= 18. Supports PPR plan messages to dispatch plans (with roles and reviewers) across machines.",
   "type": "module",
   "license": "MIT",

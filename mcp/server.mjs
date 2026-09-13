@@ -37,7 +37,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import readline from 'node:readline';
 
-const SERVER_VERSION = '1.2.0'; // 必须与 package.json / .zcode-plugin/plugin.json 一致
+const SERVER_VERSION = '1.3.0'; // 必须与 package.json / .zcode-plugin/plugin.json 一致
 const BRIDGE_MARKER = 1;            // 信封协议版本号（body.bridge === 1 才算本桥消息）
 const MAX_BODY_CHARS = 60000;       // GitHub issue/comment 正文上限 65536，留余量
 const INBOX_PAGE = 100;             // 单次拉取上限（GitHub per_page 最大 100）
@@ -255,6 +255,28 @@ async function gh(method, apiPath, { token, apiBase, body } = {}) {
 const PLAN_ROLES = ['planner', 'producer', 'reviewer'];
 
 /**
+ * 断言若干字段"若存在则必须是字符串"。
+ *
+ * 为什么需要：plan/proposal 里的 identity 类字段（reviewer/assignee）与标识类字段
+ * （id/parentId）在接收端最终要落进 taskswarm 的任务对象。若这里放行对象/数字，
+ * 接收端要么强转成 "[object Object]"（静默产生坏数据），要么在更深处报出难懂的错。
+ * 在发送端拦住，错误能直接指向字段与改法。
+ */
+function assertStringFields(obj, where, fields) {
+  for (const field of fields) {
+    const v = obj?.[field];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== 'string') {
+      const kind = Array.isArray(v) ? 'array' : typeof v;
+      throw new Error(`${where}.${field} 必须是字符串（当前类型：${kind}）。下一步：改成身份/标识字符串（如 "wersky/agent-3"），或省略该字段。`);
+    }
+    if (v.trim() === '') {
+      throw new Error(`${where}.${field} 不能是空字符串。下一步：填具体值，或省略该字段。`);
+    }
+  }
+}
+
+/**
  * plan 类型消息的结构校验（PPR：Planner 出计划 → 分工给 Producer → 指定 Reviewer 审核）。
  *
  * 为什么强制校验：type 本身是自由字符串，任何结构化约定都会随使用漂移。
@@ -291,9 +313,79 @@ function assertPlanShape(data) {
     if (item.dependsOn !== undefined && item.dependsOn !== null && !Array.isArray(item.dependsOn)) {
       throw new Error(`plan 消息的 data.plan[${i}].dependsOn 必须是字符串数组。下一步：写成 {"dependsOn":["T1"]} 或省略。`);
     }
+    // 与 proposal 同样的身份/标识字段类型守卫（见 assertStringFields 注释）
+    assertStringFields(item, `plan 消息的 data.plan[${i}]`, ['id', 'reviewer', 'assignee', 'parentId']);
   });
   if (data.reviewer !== undefined && data.reviewer !== null && String(data.reviewer).trim() !== '' && String(data.reviewer).length > 80) {
     throw new Error(`plan 消息的 data.reviewer 身份过长（${String(data.reviewer).length} > 80）。下一步：用简短身份，如 "alice/main"。`);
+  }
+  return true;
+}
+
+/**
+ * proposal 类型消息的结构校验（执行中发现的问题 + 建议新增的计划项 → 交对方 reviewer 审阅采纳）。
+ *
+ * 为什么强制校验：proposal 是「计划之外的新增项」的正式提交通道——生产者/子代理在跑任务时
+ * 撞见的问题与补救动作，必须结构化才能让对方 reviewer **逐项**采纳/驳回，并直接并入本地任务树。
+ * 若退化成自由文本，建议会被淹没在聊天里；items 的字段（role/dependsOn/reviewer/assignee）
+ * 刻意与 plan 子项同构，采纳后无需二次翻译即可落进 taskswarm 任务树。
+ *
+ * 规范：data = {
+ *   forTask?: string,        // 针对哪个任务（可选，如 "T2"）
+ *   problem?: string,        // 发现的问题/阻塞（可选）
+ *   items?: [ { id?, title, detail?, dependsOn?[], role?, reviewer?, assignee? } ],  // 建议新增的计划项
+ *   rationale?: string       // 为什么这么建议（可选）
+ * }
+ * 约束：problem 与 items 至少要有一样——两者都缺的 proposal 没有任何可供审阅的内容。
+ */
+function assertProposalShape(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('proposal 消息的 data 必须是对象。下一步：写成 {"problem":"一句话问题","items":[{"title":"建议新增什么"}]} 形式（problem 与 items 至少写一个）。');
+  }
+  if (data.problem !== undefined && data.problem !== null && typeof data.problem !== 'string') {
+    throw new Error('proposal 消息的 data.problem 必须是字符串。下一步：用一句话描述发现的问题/阻塞（如 "T2 依赖的接口尚未实现"）。');
+  }
+  const problem = typeof data.problem === 'string' ? data.problem.trim() : '';
+  if (data.items !== undefined && data.items !== null && !Array.isArray(data.items)) {
+    throw new Error('proposal 消息的 data.items 必须是数组。下一步：每个建议项写成 {"title":"建议新增什么","role":"producer"}，整组放进 items。');
+  }
+  const items = Array.isArray(data.items) ? data.items : [];
+  if (problem === '' && items.length === 0) {
+    throw new Error('proposal 消息的 data 至少要有 problem（发现的问题/阻塞）或 items（建议新增的计划项）之一。下一步：写成 {"problem":"..."} 或 {"items":[{"title":"..."}]}；只给 rationale/forTask 不算提案。');
+  }
+  items.forEach((item, i) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error(`proposal 消息的 data.items[${i}] 必须是对象。下一步：写成 {"title":"建议新增什么","role":"producer"}。`);
+    }
+    if (String(item.title ?? '').trim() === '') {
+      throw new Error(`proposal 消息的 data.items[${i}] 缺少 title。下一步：为每个建议项写明"建议新增什么"（一句话）；对方 reviewer 据此逐项采纳。`);
+    }
+    if (item.role !== undefined && item.role !== null && String(item.role).trim() !== '') {
+      const r = String(item.role).trim().toLowerCase();
+      if (!PLAN_ROLES.includes(r)) {
+        throw new Error(`proposal 消息的 data.items[${i}].role 非法（收到 "${item.role}"）。下一步：改用 ${PLAN_ROLES.join(' / ')} 之一（省略则按对方默认分工）。`);
+      }
+    }
+    if (item.dependsOn !== undefined && item.dependsOn !== null && !Array.isArray(item.dependsOn)) {
+      throw new Error(`proposal 消息的 data.items[${i}].dependsOn 必须是字符串数组。下一步：写成 {"dependsOn":["T2"]} 或省略。`);
+    }
+    // 身份类与标识类字段必须是字符串：非字符串会在接收端被强转成 "[object Object]"
+    // 这类脏值写进任务（reviewer 从此没有合法裁决者、只能 force 绕过）。
+    // 必须在**发送端**拦住——跨机器场景下让坏数据上路，排查成本极高（真机验证暴露）。
+    assertStringFields(item, `proposal 消息的 data.items[${i}]`, ['id', 'reviewer', 'assignee', 'parentId']);
+  });
+  if (data.forTask !== undefined && data.forTask !== null) {
+    if (typeof data.forTask !== 'string' || data.forTask.trim() === '') {
+      throw new Error('proposal 消息的 data.forTask 必须是非空字符串。下一步：填任务标识（如 "T2"）或整个省略。');
+    }
+    if (data.forTask.length > 80) {
+      throw new Error(`proposal 消息的 data.forTask 过长（${data.forTask.length} > 80）。下一步：只写任务标识（如 "T2"），详细上下文放 problem/body 里。`);
+    }
+  }
+  if (data.rationale !== undefined && data.rationale !== null) {
+    if (typeof data.rationale !== 'string' || data.rationale.trim() === '') {
+      throw new Error('proposal 消息的 data.rationale 必须是非空字符串。下一步：用一两句说明为什么提这个建议，或整个省略。');
+    }
   }
   return true;
 }
@@ -303,10 +395,11 @@ function makeEnvelope({ from, to, type, subject, body, data, inReplyTo }) {
     throw new Error('缺少 to。下一步：填收件方身份（如 "alice/main"），发给对方全部代理用 "alice/*"，广播用 "*"。');
   }
   if (!type) {
-    throw new Error('缺少 type。下一步：从约定类型里选一个：hello(握手) / chat(自由沟通) / task(委派任务) / plan(PPR 计划) / status(进展) / result(结果) / file(产物交付) / bye(收工)；也可以自定义，接收方按约定理解。');
+    throw new Error('缺少 type。下一步：从约定类型里选一个：hello(握手) / chat(自由沟通) / task(委派任务) / plan(PPR 计划) / proposal(问题+建议计划项，供对方 reviewer 审阅) / status(进展) / result(结果) / file(产物交付) / bye(收工)；也可以自定义，接收方按约定理解。');
   }
   const t = String(type).trim();
   if (t === 'plan') assertPlanShape(data);   // 计划是跨机器编排载体，格式必须卡住
+  if (t === 'proposal') assertProposalShape(data);   // 提案要被逐项审阅采纳，problem/items 结构必须卡住
   const env = {
     bridge: BRIDGE_MARKER,
     id: crypto.randomUUID(),
@@ -800,15 +893,15 @@ const TOOLS = [
     },
   },
   {
-    name: 'bridge_send', description: '给对方 agent 发消息（新建线程）。type 约定：hello/chat/task/plan/status/result/file/bye。type=plan 时为 PPR 计划，data 必须形如 {plan:[{id,title,detail?,dependsOn?,role?,reviewer?}], reviewer?, producer?}——对方会照它建本地任务树（含审核门）。',
+    name: 'bridge_send', description: '给对方 agent 发消息（新建线程）。type 约定：hello/chat/task/plan/proposal/status/result/file/bye。type=plan 时为 PPR 计划，data 必须形如 {plan:[{id,title,detail?,dependsOn?,role?,reviewer?}], reviewer?, producer?}——对方会照它建本地任务树（含审核门）。type=proposal 时为「问题+建议新增计划项」，data 形如 {forTask?, problem?, items?:[{id?,title,detail?,dependsOn?,role?,reviewer?,assignee?}], rationale?}，其中 problem 与 items 至少要有一个——对方 reviewer 按其逐项审阅采纳。',
     inputSchema: {
       type: 'object', required: ['to', 'type'],
       properties: {
         to: { type: 'string', description: '收件方身份，如 "alice/main"；发给对方全部子代理用 "alice/*"；广播用 "*"' },
-        type: { type: 'string', description: '消息类型：hello/chat/task/plan/status/result/file/bye 或自定义' },
+        type: { type: 'string', description: '消息类型：hello/chat/task/plan/proposal/status/result/file/bye 或自定义' },
         subject: { type: 'string', description: '一句话主题' },
         body: { type: 'string', description: '正文（自由文本）' },
-        data: { type: 'object', description: '结构化负载。task: {goal,detail}；plan（PPR 计划）: {plan:[{id,title,detail?,dependsOn?,role?,reviewer?}], reviewer?, producer?}；result: {artifacts:[...]}' },
+        data: { type: 'object', description: '结构化负载。task: {goal,detail}；plan（PPR 计划）: {plan:[{id,title,detail?,dependsOn?,role?,reviewer?}], reviewer?, producer?}；proposal（问题+建议计划项）: {forTask?, problem?, items?:[{id?,title,detail?,dependsOn?,role?,reviewer?,assignee?}], rationale?}（problem 与 items 至少一个）；result: {artifacts:[...]}' },
         from: { type: 'string', description: '发件身份覆盖（默认 BRIDGE_ID）。子代理用 "wersky/agent-1" 这类子身份' },
         repo: { type: 'string', description: '覆盖 BRIDGE_REPO（"owner/name"）' },
       },
@@ -834,14 +927,14 @@ const TOOLS = [
     },
   },
   {
-    name: 'bridge_reply', description: '在线程内回帖（自动回给线程发起方，除非显式 to）。',
+    name: 'bridge_reply', description: '在线程内回帖（自动回给线程发起方，除非显式 to）。type=proposal 时同样按提案结构校验：data 形如 {forTask?, problem?, items?:[{id?,title,detail?,dependsOn?,role?,reviewer?,assignee?}], rationale?}（problem 与 items 至少一个）。',
     inputSchema: {
       type: 'object', required: ['issue', 'body'],
       properties: {
         issue: { type: 'number' },
         body: { type: 'string' },
-        type: { type: 'string', description: '默认 reply，可传 status/result 等' },
-        data: { type: 'object' },
+        type: { type: 'string', description: '默认 reply，可传 status/result/proposal 等' },
+        data: { type: 'object', description: '结构化负载。proposal（回帖形式的问题/建议）: {forTask?, problem?, items?:[{id?,title,detail?,dependsOn?,role?,reviewer?,assignee?}], rationale?}（problem 与 items 至少一个）' },
         from: { type: 'string', description: '发件身份覆盖' },
         repo: { type: 'string' },
       },

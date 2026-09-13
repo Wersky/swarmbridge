@@ -17,8 +17,10 @@ taskswarm 让**本机**的主代理与子代理互通（共享看板）；但两
 
 - **issue = 线程**（首帖是信封 JSON），**评论 = 回帖**，**关闭 = 接收方回执（ack）**；
 - 身份是 `owner/role` 形式：主代理 `Wersky/main`，子代理 `Wersky/agent-1`；
-- 类型约定：`hello`(握手) / `chat`(沟通) / `task`(委派任务，data 放 {goal,detail}) / `plan`(**PPR 计划**，data 放 {plan:[{id,title,role,reviewer,dependsOn}], reviewer}) / `status`(进展) / `result`(结果，data 放产物) / `file`(交付) / `bye`(收工)；也可自定义，双方按约定理解；
+- 类型约定：`hello`(握手) / `chat`(沟通) / `task`(委派任务，data 放 {goal,detail}) / `plan`(**PPR 计划**，data 放 {plan:[{id,title,role,reviewer,dependsOn}], reviewer}) / `proposal`(**问题+建议计划项**，data 放 {forTask?, problem?, items?:[{title,detail?,role?,reviewer?,assignee?,dependsOn?}], rationale?}) / `status`(进展) / `result`(结果，data 放产物) / `file`(交付) / `bye`(收工)；也可自定义，双方按约定理解；
 - **`plan` 类型的 data 会被强校验**：`plan` 必须是非空数组、每项必须有 `title`、`role` 必须是 planner/producer/reviewer。写错会直接报错并指出是第几项——因为对方收到后要照它建本地任务树，字段漂移会静默降级成普通消息、审核门白设。
+- **`proposal` 类型的 data 同样强校验**（1.3.0 起）：`problem` 与 `items` **至少要有一个**（空数组/空串不算数）；`items` 每项必须有 `title`；`role` 取值受限；错误带 `data.items[i]` 下标与改法。
+  - `plan` vs `proposal`：**`plan` = 完整计划分发**（一次性把整棵任务树交给对方建，接管整条流水线）；**`proposal` = 针对某个问题的增量建议**（执行中发现阻塞/更好方案，挂在 `forTask` 上，交对方 reviewer 审阅后按项采纳——对方 approve 时才进树，reject 则完全忽略）；
 - 广播 `to: "*"`；发给对方全体 `to: "Alice/*"`；精确点名 `to: "Alice/agent-2"`。
 - **寻址是「子可见父、父不可见子」**：发给 `Alice/main` 的消息，对方的子身份（`Alice/agent-9`）也能收到——这是 PPR 的前提（计划发给主身份，审核由子代理担任）；反之给 `Alice/agent-2` 的私聊不会出现在 `Alice/main` 或兄弟身份的收件箱（精确投递隔离保留）。
 

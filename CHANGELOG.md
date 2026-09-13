@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-13
+
+### Added
+
+- **`proposal` 消息类型（问题 + 建议新增计划项）**：`data = {forTask?, problem?, items?:[{id?,title,detail?,dependsOn?,role?,reviewer?,assignee?}], rationale?}`。
+  这是「计划之外的新增项」的正式提交通道——生产者/子代理在执行中发现的阻塞或更好的方案，
+  经此通道提交给对方 reviewer 审阅采纳。与 `plan` 的分工：`plan` 是**完整的计划分发**
+  （一次性把整棵任务树交给对方建），`proposal` 是**针对某个问题的增量建议**
+  （挂在某任务的执行上下文中，供对方审核后按项采纳）。
+- **发送端强校验（`assertProposalShape`）**，错误信息带下标与改法：
+  - `problem` 与 `items` **至少要有一个**（两者皆缺的提案没有可供审阅的内容）；
+  - `items` 必须是数组，且**每项必须带 `title`**（缺失报 `data.items[i] 缺少 title`）；
+  - `items[].role` **取值受限**（planner/producer/reviewer，非法值报错并列出可用值）；
+  - `items[].dependsOn` 必须是字符串数组；`forTask` 须为非空字符串且 ≤ 80 字符；`rationale` 须为非空字符串；
+  - `bridge_reply` 传 `type:"proposal"` 时走同一套校验；非 `proposal`/`plan` 类型的 `data` 不受约束（`chat` 随意字段仍可发）。
+
 ## [1.2.0] - 2026-09-13
 
 ### Added

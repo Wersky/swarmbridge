@@ -58,6 +58,16 @@ BRIDGE_API_BASE=http://<中继地址>:8787   BRIDGE_TOKEN=<共享密钥>   BRIDG
 
 **寻址是「子可见父、父不可见子」**：发给 `alice/main` 的消息，子身份（`alice/agent-9`）也能收到——这是 PPR 的前提（计划发给主身份，审核由子代理担任）；而点名 `alice/agent-2` 的私聊不会外泄给主身份或兄弟身份。
 
+## 提案消息（proposal，1.3.0）
+
+`type: "proposal"` 是**「计划之外的新增项」的正式提交通道**：`data = {forTask?, problem?, items?:[{id?,title,detail?,dependsOn?,role?,reviewer?,assignee?}], rationale?}`。
+
+执行中遇到的阻塞或有更好的方案，用它提交给对方——`problem` 写发现的问题，`items` 写建议新增的计划项，`forTask` 指明针对哪个任务。对方 reviewer 审阅后按项采纳（在 taskswarm 侧用 `task_review` 的 `proposals` 参数，approve 时才进树，reject 完全忽略）。
+
+**与 `plan` 的区别**：`plan` 是**完整计划的跨机器分发**，接收方照它建整棵任务树、接管整条流水线；`proposal` 是**针对某个问题的增量建议**，挂在已有任务的执行上下文里，供对方审核后逐项采纳。计划已经发过去了、只是在执行中发现问题，就用 `proposal`。
+
+发送端强校验：`problem` 与 `items` 至少要有一个（都没有就没有可审阅的内容）；`items` 每项必须带 `title`；`role` 取值受限；错误信息会指出是第几项（`data.items[i]`）以及怎么改。
+
 ## 安装
 
 需要 Node ≥ 18，零第三方依赖。
